@@ -17,10 +17,19 @@ from distutils.version import LooseVersion
 TORCH_GE_1_8_0 = LooseVersion(torch.__version__) >= LooseVersion('1.8.0')
 
 try:
+    import xdev
+    profile = xdev.profile
+except Exception:
+    profile = ub.identity
+
+try:
     from apex import amp
     APEX_AVAILABLE = True
 except:
     APEX_AVAILABLE = False
+
+
+SLOW_MODE = 1
 
 # helpers
 
@@ -87,6 +96,7 @@ class PreShiftTokens(nn.Module):
 # transcribed from jax to pytorch from
 # https://github.com/google-research/google-research/blob/master/performer/fast_attention/jax/fast_attention.py
 
+@profile
 def softmax_kernel(data, *, projection_matrix, is_query, normalize_data=True, eps=1e-4, device = None):
     b, h, *_ = data.shape
 
@@ -94,14 +104,28 @@ def softmax_kernel(data, *, projection_matrix, is_query, normalize_data=True, ep
 
     ratio = (projection_matrix.shape[0] ** -0.5)
 
-    projection = repeat(projection_matrix, 'j d -> b h j d', b = b, h = h)
+    if SLOW_MODE:
+        projection = repeat(projection_matrix, 'j d -> b h j d', b = b, h = h)
+    else:
+        projection = torch.tile(projection_matrix[None, None, ...], (b, h, 1, 1))
+
     projection = projection.type_as(data)
 
-    data_dash = torch.einsum('...id,...jd->...ij', (data_normalizer * data), projection)
+    data_norm = (data_normalizer * data)
 
-    diag_data = data ** 2
+    if SLOW_MODE:
+        data_dash = torch.einsum('...id,...jd->...ij', data_norm, projection)
+    else:
+        shape1 = data_norm.shape
+        shape2 = projection.shape
+        data_norm_ = data_norm.view(-1, shape1[-2], shape1[-1])
+        projection_ = projection.view(-1, shape2[-2], shape2[-1])
+        data_dash_ = torch.bmm(data_norm_, projection_.permute(0, 2, 1))
+        data_dash = data_dash_.view(*shape1[:-1], shape2[-2])
+
+    diag_data = data * data
     diag_data = torch.sum(diag_data, dim=-1)
-    diag_data = (diag_data / 2.0) * (data_normalizer ** 2)
+    diag_data = (diag_data / 2.0) * (data_normalizer * data_normalizer)
     diag_data = diag_data.unsqueeze(dim=-1)
 
     if is_query:
@@ -166,12 +190,27 @@ def gaussian_orthogonal_random_matrix(nb_rows, nb_columns, scaling = 0, device =
 
 # linear attention classes with softmax kernel
 
+
+def _bmm2(a, b):
+    bdims = a.shape[0:-2]
+    i, j = a.shape[-2:]
+    j, k = b.shape[-2:]
+    return torch.bmm(a.view(-1, i, j), b.view(-1, j, k)).view(*bdims, i, k)
+
 # non-causal linear attention
+@profile
 def linear_attention(q, k, v):
-    k_cumsum = k.sum(dim = -2)
-    D_inv = 1. / torch.einsum('...nd,...d->...n', q, k_cumsum.type_as(q))
-    context = torch.einsum('...nd,...ne->...de', k, v)
-    out = torch.einsum('...de,...nd,...n->...ne', context, q, D_inv)
+    k_cumsum = k.sum(dim = -2).type_as(q)
+    if SLOW_MODE:
+        D = torch.einsum('...nd,...d->...n', q, k_cumsum)
+        D_inv = 1. / D
+        context = torch.einsum('...nd,...ne->...de', k, v)
+        out = torch.einsum('...de,...nd,...n->...ne', context, q, D_inv)
+    else:
+        D = _bmm2(q, k_cumsum[:, :, :, None]).squeeze(-1)
+        D_inv = 1. / D
+        context = _bmm2(k.permute(0, 1, 3, 2), v)
+        out = _bmm2(context.permute(0, 1, 3, 2), (q * D_inv[..., None]).permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
     return out
 
 # efficient causal linear attention, created by EPFL
@@ -253,6 +292,7 @@ class FastAttention(nn.Module):
         self.projection_matrix.copy_(projections)
         del projections
 
+    @profile
     def forward(self, q, k, v):
         device = q.device
 
@@ -261,13 +301,21 @@ class FastAttention(nn.Module):
             k = torch.exp(k) if self.causal else k.softmax(dim = -2)
 
         elif self.generalized_attention:
-            create_kernel = partial(generalized_kernel, kernel_fn = self.kernel_fn, projection_matrix = self.projection_matrix, device = device)
-            q, k = map(create_kernel, (q, k))
+            kernel_kw = {
+                'kernel_fn': self.kernel_fn,
+                'projection_matrix': self.projection_matrix,
+                'device': device,
+            }
+            q = generalized_kernel(q, **kernel_kw)
+            k = generalized_kernel(k, **kernel_kw)
 
         else:
-            create_kernel = partial(softmax_kernel, projection_matrix = self.projection_matrix, device = device)
-            q = create_kernel(q, is_query = True)
-            k = create_kernel(k, is_query = False)
+            kernel_kw = {
+                'projection_matrix': self.projection_matrix,
+                'device': device
+            }
+            q = softmax_kernel(q, is_query = True, **kernel_kw)
+            k = softmax_kernel(k, is_query = False, **kernel_kw)
 
         attn_fn = linear_attention if not self.causal else self.causal_linear_fn
         out = attn_fn(q, k, v)
